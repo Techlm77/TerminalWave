@@ -20,6 +20,7 @@
 
 namespace fs = std::filesystem;
 
+// Constants
 #define BUFFER_SIZE 8192
 #define FRAMES_PER_BUFFER 512
 #define FFT_SIZE 1024
@@ -63,13 +64,25 @@ int listOffset = 0;
 const int HEADER_LINES = 2; // "File Browser" and "[..]"
 const int HELP_LINES = 3;   // Help instructions
 
+// Structure to hold playback status
+struct PlaybackStatus {
+    std::string currentTrack;
+    double currentSec;
+    double totalSec;
+    std::vector<int16_t> waveform;
+    std::vector<double> spectrum;
+};
+
+std::mutex playbackMutex;
+PlaybackStatus playbackStatus;
+
 // Function to close the TUI
 void close_tui() {
     if (waveWin) {
         delwin(waveWin);
         waveWin = nullptr;
     }
-    
+
     if (navWin) {
         delwin(navWin);
         navWin = nullptr;
@@ -79,16 +92,9 @@ void close_tui() {
 
 // Function to reinitialize windows upon resize
 void cleanup_and_reinit_windows() {
-    if (navWin) {
-        delwin(navWin);
-        navWin = nullptr;
-    }
-
-    if (waveWin) {
-        delwin(waveWin);
-        waveWin = nullptr;
-    }
     endwin();
+    refresh();
+    clear();
 
     initscr();
     cbreak();
@@ -97,6 +103,7 @@ void cleanup_and_reinit_windows() {
     keypad(stdscr, true);
     if (!has_colors()) {
         endwin();
+        std::cerr << "Terminal does not support color." << std::endl;
         exit(1);
     }
     start_color();
@@ -107,8 +114,21 @@ void cleanup_and_reinit_windows() {
     mousemask(0, nullptr);
     getmaxyx(stdscr, totalH, totalW);
     halfH = totalH / 2;
-    navWin = newwin(halfH, totalW, 0, 0);
-    waveWin = newwin(totalH - halfH, totalW, halfH, 0);
+
+    if (navWin) {
+        wresize(navWin, halfH, totalW);
+        mvwin(navWin, 0, 0);
+    } else {
+        navWin = newwin(halfH, totalW, 0, 0);
+    }
+
+    if (waveWin) {
+        wresize(waveWin, totalH - halfH, totalW);
+        mvwin(waveWin, halfH, 0);
+    } else {
+        waveWin = newwin(totalH - halfH, totalW, halfH, 0);
+    }
+
     box(navWin, 0, 0);
     box(waveWin, 0, 0);
     wrefresh(navWin);
@@ -124,6 +144,7 @@ void init_tui() {
     keypad(stdscr, true);
     if (!has_colors()) {
         endwin();
+        std::cerr << "Terminal does not support color." << std::endl;
         exit(1);
     }
     start_color();
@@ -251,11 +272,18 @@ bool play_file(const std::string& path) {
     double* fftIn = (double*)fftw_malloc(sizeof(double) * FFT_SIZE);
     fftw_complex* fftOut = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (FFT_SIZE / 2 + 1));
     fftPlan = fftw_plan_dft_r2c_1d(FFT_SIZE, fftIn, fftOut, FFTW_MEASURE);
+    {
+        std::lock_guard<std::mutex> lock(playbackMutex);
+        playbackStatus.currentTrack = path;
+        playbackStatus.currentSec = 0.0;
+        playbackStatus.totalSec = totalSec;
+        playbackStatus.waveform.assign(FRAMES_PER_BUFFER, 0);
+        playbackStatus.spectrum.assign(FFT_SIZE / 2, 0.0);
+    }
 
     while (!shouldQuit.load() && !stopTrack.load()) {
         if (needResize.load()) {
             needResize.store(false);
-            cleanup_and_reinit_windows();
         }
 
         if (isPaused.load()) {
@@ -285,107 +313,47 @@ bool play_file(const std::string& path) {
             mpg123_seek(mh, newPos, SEEK_SET);
         }
 
-        int waveH;
-        int waveW;
-        getmaxyx(waveWin, waveH, waveW);
-        std::vector<int16_t> waveform(waveW, 0);
         size_t done = 0;
         int ret = mpg123_read(mh, buffer, BUFFER_SIZE, &done);
         if (ret == MPG123_DONE) break;
         if (ret != MPG123_OK) break;
         int frames = done / (channels * sizeof(short));
         if (Pa_WriteStream(stream, buffer, frames) != paNoError) break;
-        int16_t* samples = reinterpret_cast<int16_t*>(buffer);
-        int totalSamplesFrame = done / sizeof(int16_t) / channels;
-        for (int i = 0; i < waveW; i++) {
-            int idx = (i * totalSamplesFrame) / waveW;
-            if (idx < totalSamplesFrame) waveform[i] = samples[idx * channels];
+        {
+            std::lock_guard<std::mutex> lock(playbackMutex);
+            playbackStatus.currentSec = static_cast<double>(mpg123_tell(mh)) / static_cast<double>(rate);
+            int16_t* samples = reinterpret_cast<int16_t*>(buffer);
+            int totalSamplesFrame = done / sizeof(int16_t) / channels;
+            playbackStatus.waveform.assign(samples, samples + totalSamplesFrame);
         }
 
-        off_t curSamp = mpg123_tell(mh);
-        double curSec = 0.0;
-        if (curSamp >= 0) {
-            curSec = static_cast<double>(curSamp) / static_cast<double>(rate);
-        }
-
-        werase(waveWin);
-        box(waveWin, 0, 0);
-        wattron(waveWin, COLOR_PAIR(1));
-        mvwprintw(waveWin, 0, 2, "Playing: %s", path.c_str());
-        wattroff(waveWin, COLOR_PAIR(1));
-        char cb[16];
-        char tb[16];
-        format_time(curSec, cb, sizeof(cb));
-        format_time(totalSec, tb, sizeof(tb));
-        wattron(waveWin, COLOR_PAIR(3));
-        mvwprintw(waveWin, waveH - 1, 2, "%s / %s", cb, tb);
-        mvwprintw(waveWin, waveH - 1, 20, "Mode: %s", (visMode.load() == WAVEFORM) ? "Waveform" : "Spectrum");
-        wattroff(waveWin, COLOR_PAIR(3));
-
-        if (visMode.load() == WAVEFORM) {
-            for (int i = 0; i < waveW; i++) {
-                double val = static_cast<double>(waveform[i]) / 32768.0;
-                int y = static_cast<int>((val + 1.0) * 0.5 * (waveH - 3));
-                if (y < 0) y = 0;
-                if (y >= waveH - 2) y = waveH - 3;
-                wattron(waveWin, COLOR_PAIR(2));
-                mvwprintw(waveWin, (waveH - 2) - y - 1, i, "*");
-                wattroff(waveWin, COLOR_PAIR(2));
-            }
-        } else if (visMode.load() == SPECTRUM) {
-            for (size_t i = 0; i < static_cast<size_t>(done / sizeof(int16_t) / channels) && i < static_cast<size_t>(FFT_SIZE); i++) {
-                fftIn[i] = static_cast<double>(samples[i * channels]) / 32768.0;
-            }
-
-            for (size_t i = done / sizeof(int16_t) / channels; i < static_cast<size_t>(FFT_SIZE); i++) {
-                fftIn[i] = 0.0;
-            }
-            fftw_execute(fftPlan);
-            std::vector<double> magnitudes(FFT_SIZE / 2, 0.0);
-            double maxMag = 0.0;
-            for (size_t i = 0; i < FFT_SIZE / 2; i++) {
-                magnitudes[i] = sqrt(fftOut[i][0] * fftOut[i][0] + fftOut[i][1] * fftOut[i][1]);
-                if (magnitudes[i] > maxMag) {
-                    maxMag = magnitudes[i];
+        {
+            std::lock_guard<std::mutex> lock(playbackMutex);
+            if (playbackStatus.waveform.size() >= FFT_SIZE) {
+                for (int i = 0; i < FFT_SIZE; i++) {
+                    fftIn[i] = static_cast<double>(playbackStatus.waveform[i]) / 32768.0;
                 }
-            }
-
-            int numBars = waveW;
-            int binsPerBar = (FFT_SIZE / 2) / numBars;
-            if (binsPerBar < 1) binsPerBar = 1;
-            std::vector<double> barMagnitudes(numBars, 0.0);
-            for (int i = 0; i < numBars; i++) {
-                int startIdx = i * binsPerBar;
-                int endIdx = startIdx + binsPerBar;
-                if (endIdx > FFT_SIZE / 2) endIdx = FFT_SIZE / 2;
-                double sum = 0.0;
-                for (int j = startIdx; j < endIdx; j++) {
-                    sum += magnitudes[j];
+                for (int i = FFT_SIZE; i < FRAMES_PER_BUFFER; i++) {
+                    fftIn[i] = 0.0;
                 }
-
-                double avg = sum / (endIdx - startIdx);
-                barMagnitudes[i] = avg;
-                if (avg > maxMag) {
-                    maxMag = avg;
+                fftw_execute(fftPlan);
+                double maxMag = 0.0;
+                for (int i = 0; i < FFT_SIZE / 2; i++) {
+                    double mag = sqrt(fftOut[i][0] * fftOut[i][0] + fftOut[i][1] * fftOut[i][1]);
+                    playbackStatus.spectrum[i] = mag;
+                    if (mag > maxMag) {
+                        maxMag = mag;
+                    }
                 }
-            }
-
-            for (int i = 0; i < numBars; i++) {
-                double mag = barMagnitudes[i];
-                int barHeight = 0;
-                if (maxMag > 0.0) {
-                    barHeight = static_cast<int>((log(mag + 1.0) / log(maxMag + 1.0)) * (waveH - 3));
-                    if (barHeight > waveH - 3) barHeight = waveH - 3;
-                }
-                for (int y = 0; y < barHeight; y++) {
-                    wattron(waveWin, COLOR_PAIR(2));
-                    mvwprintw(waveWin, waveH - 2 - y, i, "|");
-                    wattroff(waveWin, COLOR_PAIR(2));
+                for (auto& mag : playbackStatus.spectrum) {
+                    mag = mag / maxMag;
                 }
             }
         }
-        wrefresh(waveWin);
+
+        usleep(10000);
     }
+
     fftw_destroy_plan(fftPlan);
     fftw_free(fftIn);
     fftw_free(fftOut);
@@ -400,7 +368,7 @@ bool play_file(const std::string& path) {
 }
 
 // Audio playback thread
-void audio_thread() {
+void audio_thread_func() {
     while (!shouldQuit.load()) {
         std::string nextPath;
         {
@@ -471,18 +439,95 @@ void draw_navigation(const fs::path& current, const std::vector<fs::directory_en
     wrefresh(navWin);
 }
 
+// Function to draw the waveform visualization
+void draw_waveform(const int waveH, const int waveW) {
+    std::lock_guard<std::mutex> lock(playbackMutex);
+    werase(waveWin);
+    box(waveWin, 0, 0);
+    wattron(waveWin, COLOR_PAIR(1));
+    mvwprintw(waveWin, 0, 2, "Playing: %s", playbackStatus.currentTrack.c_str());
+    wattroff(waveWin, COLOR_PAIR(1));
+
+    char cb[16];
+    char tb[16];
+    format_time(playbackStatus.currentSec, cb, sizeof(cb));
+    format_time(playbackStatus.totalSec, tb, sizeof(tb));
+    wattron(waveWin, COLOR_PAIR(3));
+    mvwprintw(waveWin, waveH - 1, 2, "%s / %s", cb, tb);
+    mvwprintw(waveWin, waveH - 1, 20, "Mode: %s", (visMode.load() == WAVEFORM) ? "Waveform" : "Spectrum");
+    wattroff(waveWin, COLOR_PAIR(3));
+
+    if (visMode.load() == WAVEFORM) {
+        const auto& waveform = playbackStatus.waveform;
+        if (waveform.empty()) return;
+
+        for (int i = 0; i < waveW; i++) {
+            int idx = (i * waveform.size()) / waveW;
+            if (idx >= static_cast<int>(waveform.size())) idx = waveform.size() - 1;
+            double val = static_cast<double>(waveform[idx]) / 32768.0;
+            int y = static_cast<int>((val + 1.0) * 0.5 * (waveH - 3));
+            if (y < 0) y = 0;
+            if (y >= waveH - 2) y = waveH - 3;
+            wattron(waveWin, COLOR_PAIR(2));
+            mvwprintw(waveWin, (waveH - 2) - y - 1, i, "*");
+            wattroff(waveWin, COLOR_PAIR(2));
+        }
+    } else if (visMode.load() == SPECTRUM) {
+        const auto& spectrum = playbackStatus.spectrum;
+        if (spectrum.empty()) return;
+
+        int numBars = waveW;
+        int binsPerBar = (FFT_SIZE / 2) / numBars;
+        if (binsPerBar < 1) binsPerBar = 1;
+        std::vector<double> barMagnitudes(numBars, 0.0);
+        for (int i = 0; i < numBars; i++) {
+            int startIdx = i * binsPerBar;
+            int endIdx = startIdx + binsPerBar;
+            if (endIdx > FFT_SIZE / 2) endIdx = FFT_SIZE / 2;
+            double sum = 0.0;
+            for (int j = startIdx; j < endIdx; j++) {
+                sum += spectrum[j];
+            }
+
+            double avg = sum / (endIdx - startIdx);
+            barMagnitudes[i] = avg;
+        }
+
+        for (int i = 0; i < numBars; i++) {
+            double mag = barMagnitudes[i];
+            int barHeight = static_cast<int>(mag * (waveH - 3));
+            if (barHeight > waveH - 3) barHeight = waveH - 3;
+            for (int y = 0; y < barHeight; y++) {
+                wattron(waveWin, COLOR_PAIR(2));
+                mvwprintw(waveWin, waveH - 2 - y, i, "|");
+                wattroff(waveWin, COLOR_PAIR(2));
+            }
+        }
+    }
+
+    wrefresh(waveWin);
+}
+
 // Signal handler for window resize
 void on_resize(int) {
     needResize.store(true);
 }
 
 int main() {
-    signal(SIGWINCH, on_resize);
+    struct sigaction sa;
+    sa.sa_handler = on_resize;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGWINCH, &sa, nullptr) == -1) {
+        std::cerr << "Failed to set up SIGWINCH handler." << std::endl;
+        return 1;
+    }
+
     init_tui();
     fs::path currentDir = fs::path(getenv("HOME"));
     auto dirList = list_directory(currentDir);
     int highlight = 0;
-    std::thread at(audio_thread);
+    std::thread audioThread(audio_thread_func);
     bool redraw = true;
 
     while (!shouldQuit.load()) {
@@ -492,11 +537,17 @@ int main() {
             redraw = true;
         }
 
+        {
+            int waveH, waveW;
+            getmaxyx(waveWin, waveH, waveW);
+            draw_waveform(waveH, waveW);
+        }
+
         if (redraw) {
             draw_navigation(currentDir, dirList, highlight);
             redraw = false;
         }
-        
+
         int c = getch();
         if (c == 'q' || c == 'Q') {
             shouldQuit.store(true);
@@ -547,10 +598,8 @@ int main() {
                         if (ext == ".mp3") {
                             {
                                 std::lock_guard<std::mutex> lk(playlistMutex);
-                                playlist.clear();
                                 playlist.push_back(sel.path().string());
                             }
-                            stopTrack.store(true);
                             playlistCV.notify_one();
                         }
                     }
@@ -583,7 +632,8 @@ int main() {
         }
         usleep(30000);
     }
-    if (at.joinable()) at.join();
+
+    if (audioThread.joinable()) audioThread.join();
     close_tui();
     return 0;
 }
