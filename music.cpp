@@ -251,6 +251,7 @@ bool play_file(const std::string& path) {
     double* fftIn = (double*)fftw_malloc(sizeof(double) * FFT_SIZE);
     fftw_complex* fftOut = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (FFT_SIZE / 2 + 1));
     fftPlan = fftw_plan_dft_r2c_1d(FFT_SIZE, fftIn, fftOut, FFTW_MEASURE);
+
     while (!shouldQuit.load() && !stopTrack.load()) {
         if (needResize.load()) {
             needResize.store(false);
@@ -268,7 +269,6 @@ bool play_file(const std::string& path) {
             if (!isPaused.load() && Pa_IsStreamStopped(stream) == 1) {
                 Pa_StartStream(stream);
             }
-            
             wasPaused = false;
             if (shouldQuit.load() || stopTrack.load()) {
                 break;
@@ -321,6 +321,7 @@ bool play_file(const std::string& path) {
         mvwprintw(waveWin, waveH - 1, 2, "%s / %s", cb, tb);
         mvwprintw(waveWin, waveH - 1, 20, "Mode: %s", (visMode.load() == WAVEFORM) ? "Waveform" : "Spectrum");
         wattroff(waveWin, COLOR_PAIR(3));
+
         if (visMode.load() == WAVEFORM) {
             for (int i = 0; i < waveW; i++) {
                 double val = static_cast<double>(waveform[i]) / 32768.0;
@@ -376,7 +377,6 @@ bool play_file(const std::string& path) {
                     barHeight = static_cast<int>((log(mag + 1.0) / log(maxMag + 1.0)) * (waveH - 3));
                     if (barHeight > waveH - 3) barHeight = waveH - 3;
                 }
-
                 for (int y = 0; y < barHeight; y++) {
                     wattron(waveWin, COLOR_PAIR(2));
                     mvwprintw(waveWin, waveH - 2 - y, i, "|");
@@ -386,6 +386,17 @@ bool play_file(const std::string& path) {
         }
         wrefresh(waveWin);
     }
+    fftw_destroy_plan(fftPlan);
+    fftw_free(fftIn);
+    fftw_free(fftOut);
+    Pa_StopStream(stream);
+    Pa_CloseStream(stream);
+    Pa_Terminate();
+    mpg123_close(mh);
+    mpg123_delete(mh);
+    mpg123_exit();
+    isPlaying.store(false);
+    return true;
 }
 
 // Audio playback thread
