@@ -41,7 +41,7 @@ pkg install clang ncurses mpg123 portaudio
 
 ## Building and Running TerminalWave
 ```bash
-git clone https://github.com/yourusername/TerminalWave.git
+git clone https://github.com/Techlm77/TerminalWave.git
 cd TerminalWave
 clang++ music.cpp -o music -lncurses -lmpg123 -lportaudio -lpthread -lm -lfftw3
 ./music
