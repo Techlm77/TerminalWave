@@ -48,6 +48,7 @@ std::condition_variable pauseCV;
 WINDOW* navWin = nullptr;
 WINDOW* infoWin = nullptr;
 WINDOW* waveWin = nullptr;
+
 int totalH = 0;
 int totalW = 0;
 int halfH = 0;
@@ -75,8 +76,6 @@ void close_tui() {
 void handle_resize() {
     std::lock_guard<std::mutex> lock(uiMutex);
     endwin();
-    refresh();
-    clear();
     int newH, newW;
     getmaxyx(stdscr, newH, newW);
 
@@ -110,6 +109,7 @@ void handle_resize() {
     wrefresh(navWin);
     wrefresh(infoWin);
     wrefresh(waveWin);
+    refresh();
 }
 
 void init_tui() {
@@ -121,6 +121,7 @@ void init_tui() {
 
     if (!has_colors()) {
         endwin();
+        std::cerr << "Error: Terminal does not support colors." << std::endl;
         exit(1);
     }
     start_color();
@@ -128,12 +129,12 @@ void init_tui() {
     init_pair(2, COLOR_YELLOW, COLOR_BLACK);
     init_pair(3, COLOR_CYAN, COLOR_BLACK);
 
-    timeout(0);
     mousemask(0, nullptr);
 
     getmaxyx(stdscr, totalH, totalW);
     if (totalH < 10 || totalW < 20) {
         endwin();
+        std::cerr << "Error: Terminal window too small." << std::endl;
         exit(1);
     }
     halfH = totalH / 2;
@@ -151,6 +152,7 @@ void init_tui() {
     wrefresh(navWin);
     wrefresh(infoWin);
     wrefresh(waveWin);
+    refresh();
 }
 
 std::vector<fs::directory_entry> list_directory(const fs::path& p) {
@@ -159,7 +161,8 @@ std::vector<fs::directory_entry> list_directory(const fs::path& p) {
         for (auto& x : fs::directory_iterator(p)) {
             entries.push_back(x);
         }
-    } catch (...) {
+    } catch (const std::exception& e) {
+        std::cerr << "Error accessing directory: " << e.what() << std::endl;
     }
     std::sort(entries.begin(), entries.end(), [](auto& a, auto& b) {
         if (a.is_directory() && !b.is_directory()) return true;
@@ -230,13 +233,18 @@ void draw_info(const std::string& filepath, double currentSec, double totalSec, 
 bool play_file(const std::string& path) {
     freopen("/dev/null", "w", stderr);
 
-    if (mpg123_init() != MPG123_OK) return false;
+    if (mpg123_init() != MPG123_OK) {
+        std::cerr << "mpg123 initialization failed." << std::endl;
+        return false;
+    }
     mpg123_handle* mh = mpg123_new(nullptr, nullptr);
     if (!mh) {
+        std::cerr << "Failed to create mpg123 handle." << std::endl;
         mpg123_exit();
         return false;
     }
     if (mpg123_open(mh, path.c_str()) != MPG123_OK) {
+        std::cerr << "Failed to open MP3 file: " << path << std::endl;
         mpg123_delete(mh);
         mpg123_exit();
         return false;
@@ -246,6 +254,7 @@ bool play_file(const std::string& path) {
     int channels;
     int encoding;
     if (mpg123_getformat(mh, &rate, &channels, &encoding) != MPG123_OK) {
+        std::cerr << "Failed to get MP3 format." << std::endl;
         mpg123_close(mh);
         mpg123_delete(mh);
         mpg123_exit();
@@ -262,6 +271,7 @@ bool play_file(const std::string& path) {
     }
 
     if (Pa_Initialize() != paNoError) {
+        std::cerr << "PortAudio initialization failed." << std::endl;
         mpg123_close(mh);
         mpg123_delete(mh);
         mpg123_exit();
@@ -271,6 +281,7 @@ bool play_file(const std::string& path) {
     PaStreamParameters out;
     out.device = Pa_GetDefaultOutputDevice();
     if (out.device == paNoDevice) {
+        std::cerr << "No default audio output device." << std::endl;
         Pa_Terminate();
         mpg123_close(mh);
         mpg123_delete(mh);
@@ -284,6 +295,7 @@ bool play_file(const std::string& path) {
 
     PaStream* stream = nullptr;
     if (Pa_OpenStream(&stream, nullptr, &out, rate, FRAMES_PER_BUFFER, paClipOff, nullptr, nullptr) != paNoError) {
+        std::cerr << "Failed to open PortAudio stream." << std::endl;
         Pa_Terminate();
         mpg123_close(mh);
         mpg123_delete(mh);
@@ -291,6 +303,7 @@ bool play_file(const std::string& path) {
         return false;
     }
     if (Pa_StartStream(stream) != paNoError) {
+        std::cerr << "Failed to start PortAudio stream." << std::endl;
         Pa_CloseStream(stream);
         Pa_Terminate();
         mpg123_close(mh);
@@ -309,7 +322,33 @@ bool play_file(const std::string& path) {
     fftw_plan fftPlan;
     double* fftIn = (double*)fftw_malloc(sizeof(double) * FFT_SIZE);
     fftw_complex* fftOut = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (FFT_SIZE / 2 + 1));
+    if (!fftIn || !fftOut) {
+        std::cerr << "FFTW memory allocation failed." << std::endl;
+        if (fftIn) fftw_free(fftIn);
+        if (fftOut) fftw_free(fftOut);
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        mpg123_close(mh);
+        mpg123_delete(mh);
+        mpg123_exit();
+        isPlaying.store(false);
+        return false;
+    }
     fftPlan = fftw_plan_dft_r2c_1d(FFT_SIZE, fftIn, fftOut, FFTW_MEASURE);
+    if (!fftPlan) {
+        std::cerr << "FFTW plan creation failed." << std::endl;
+        fftw_free(fftIn);
+        fftw_free(fftOut);
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        Pa_Terminate();
+        mpg123_close(mh);
+        mpg123_delete(mh);
+        mpg123_exit();
+        isPlaying.store(false);
+        return false;
+    }
 
     std::string currentFile = path;
     double currentSec = 0.0;
@@ -340,7 +379,9 @@ bool play_file(const std::string& path) {
             off_t newPos = curPos + cmd * rate;
             if (newPos < 0) newPos = 0;
             if (length > 0 && newPos > length) newPos = length;
-            mpg123_seek(mh, newPos, SEEK_SET);
+            if (mpg123_seek(mh, newPos, SEEK_SET) < 0) {
+                std::cerr << "Seek operation failed." << std::endl;
+            }
         }
 
         if (!waveWin || !infoWin) break;
@@ -372,47 +413,23 @@ bool play_file(const std::string& path) {
         box(waveWin, 0, 0);
 
         if (visMode.load() == WAVEFORM) {
-            double maxSampleValue = 32768.0;
-        
-            int samplesPerColumn = totalSamplesFrame / waveW;
-            if (samplesPerColumn < 1) samplesPerColumn = 1;
-        
-            int previousY = -1;
+            std::vector<int16_t> waveform(waveW, 0);
             for (int i = 0; i < waveW; i++) {
-                int startIdx = i * samplesPerColumn;
-                int endIdx = (i + 1) * samplesPerColumn;
-                if (endIdx > totalSamplesFrame) endIdx = totalSamplesFrame;
+                int idx = (i * totalSamplesFrame) / waveW;
+                if (idx < totalSamplesFrame) waveform[i] = samples[idx * channels];
+            }
 
-                long sum = 0;
-                int count = endIdx - startIdx;
-                for (int k = startIdx; k < endIdx; k++) {
-                    sum += samples[k * channels];
-                }
-                double avg = count > 0 ? double(sum) / double(count) : 0.0;
+            werase(waveWin);
+            box(waveWin, 0, 0);
 
-                double normalizedValue = avg / maxSampleValue;
+            for (int i = 0; i < waveW; i++) {
+                double normalizedValue = double(waveform[i]) / 32768.0;
                 int y = int((normalizedValue + 1.0) * 0.5 * (waveH - 3));
-                if (y < 0) y = 0;
-                if (y >= waveH - 2) y = waveH - 3;
-
-                char symbol = '-';
-                if (previousY != -1) {
-                    if (y > previousY) {
-                        symbol = '/';
-                    } else if (y < previousY) {
-                        symbol = '\\';
-                    } else {
-                        symbol = '-';
-                    }
-                }
-
-                int drawY = previousY == -1 ? y : std::min(y, previousY);
+                y = std::clamp(y, 0, waveH - 3);
 
                 wattron(waveWin, COLOR_PAIR(2));
-                mvwaddch(waveWin, (waveH - 2) - drawY - 1, i, symbol);
+                mvwaddch(waveWin, (waveH - 2) - y, i, '#');
                 wattroff(waveWin, COLOR_PAIR(2));
-
-                previousY = y;
             }
         } else {
             for (size_t i = 0; i < size_t(totalSamplesFrame) && i < FFT_SIZE; i++) {
@@ -421,9 +438,9 @@ bool play_file(const std::string& path) {
             for (size_t i = totalSamplesFrame; i < FFT_SIZE; i++) {
                 fftIn[i] = 0.0;
             }
-        
+
             fftw_execute(fftPlan);
-        
+
             std::vector<double> magnitudes(FFT_SIZE / 2, 0.0);
             double maxMag = 1e-9;
             for (size_t i = 0; i < FFT_SIZE / 2; i++) {
@@ -435,42 +452,34 @@ bool play_file(const std::string& path) {
                     maxMag = magVal;
                 }
             }
-        
+
             int numBars = waveW;
             int binsPerBar = (FFT_SIZE / 2) / numBars;
             if (binsPerBar < 1) binsPerBar = 1;
-        
+
             std::vector<double> barMagnitudes(numBars, 0.0);
             for (int i = 0; i < numBars; i++) {
                 int startIdx = i * binsPerBar;
-                int endIdx = startIdx + binsPerBar;
-                if (endIdx > int(FFT_SIZE / 2)) endIdx = FFT_SIZE / 2;
-        
+                int endIdx = std::min(startIdx + binsPerBar, (int)FFT_SIZE / 2);
                 double sum = 0.0;
                 for (int j = startIdx; j < endIdx; j++) {
                     sum += magnitudes[j];
                 }
-        
-                double avg = 0.0;
-                if (endIdx > startIdx) {
-                    avg = sum / (endIdx - startIdx);
-                }
+                double avg = sum / (endIdx - startIdx);
                 barMagnitudes[i] = avg;
             }
-        
+
+            werase(waveWin);
+            box(waveWin, 0, 0);
+
             for (int i = 0; i < numBars; i++) {
-                double mag = barMagnitudes[i];
-                int barHeight = 0;
-        
-                if (maxMag > 0.0) {
-                    double ratio = log(mag + 1.0) / log(maxMag + 1.0);
-                    barHeight = int(ratio * (waveH - 3));
-                    if (barHeight > waveH - 3) barHeight = waveH - 3;
-                }
-        
+                double ratio = log(barMagnitudes[i] + 1.0) / log(maxMag + 1.0);
+                int barHeight = int(ratio * (waveH - 3));
+                barHeight = std::clamp(barHeight, 0, waveH - 3);
+
                 for (int y = 0; y < barHeight; y++) {
                     wattron(waveWin, COLOR_PAIR(2));
-                    mvwprintw(waveWin, waveH - 2 - y, i, "|");
+                    mvwaddch(waveWin, waveH - 2 - y, i, '|');
                     wattroff(waveWin, COLOR_PAIR(2));
                 }
             }
@@ -720,6 +729,7 @@ int main() {
     if (at.joinable()) {
         at.join();
     }
+
     close_tui();
     return 0;
 }
