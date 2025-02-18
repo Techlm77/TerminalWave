@@ -32,7 +32,7 @@ sudo pacman -S base-devel ncurses mpg123 portaudio fftw
 
 #### Ubuntu/Linux Mint
 ```bash
-sudo apt install build-essential libncurses5-dev libmpg123-dev libportaudio2 fftw
+sudo apt install build-essential libncurses5-dev libmpg123-dev libportaudio2 fftw2
 ```
 
 #### Termux
